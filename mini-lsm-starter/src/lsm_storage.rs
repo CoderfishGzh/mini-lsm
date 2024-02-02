@@ -119,7 +119,7 @@ pub enum CompactionFilter {
 }
 
 /// The storage interface of the LSM tree.
-pub(crate) struct LsmStorageInner {
+pub struct LsmStorageInner {
     pub(crate) state: Arc<RwLock<Arc<LsmStorageState>>>,
     pub(crate) state_lock: Mutex<()>,
     path: PathBuf,
@@ -278,8 +278,31 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        let guard = self.state.read();
+        match guard.memtable.get(key) {
+            Some(e) if !e.is_empty() => return Ok(Some(e)),
+            Some(e) if e.is_empty() => return Ok(None),
+            _ => {}
+        }
+
+        for memtable in guard.imm_memtables.iter() {
+            match memtable.get(key) {
+                Some(e) if !e.is_empty() => return Ok(Some(e)),
+                Some(e) if e.is_empty() => return Ok(None),
+                _ => continue,
+            }
+        }
+        Ok(None)
+        // let guard = self.state.read();
+
+        // let result = guard.memtable.get(key).or_else(|| {
+        //     guard.imm_memtables.iter().find_map(|memtable| {
+        //         memtable.get(key).and_then(|e| if e.is_empty() { None } else { Some(e) })
+        //     })
+        // });
+
+        // Ok(result)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -288,13 +311,28 @@ impl LsmStorageInner {
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let size;
+        {
+            let rwlock_guard = self.state.read();
+            rwlock_guard.memtable.put(key, value)?;
+            size = rwlock_guard.memtable.approximate_size();
+        }
+
+        self.try_freeze(size)
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        let size;
+        {
+            let rwlock_guard = self.state.read();
+            rwlock_guard.memtable.put(key, vec![].as_slice())?;
+            size = rwlock_guard.memtable.approximate_size();
+        }
+
+        self.try_freeze(size)
+        // self.state.read().memtable.put(key, vec![].as_slice())
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -317,9 +355,40 @@ impl LsmStorageInner {
         unimplemented!()
     }
 
+    pub fn try_freeze(&self, data_size: usize) -> Result<()> {
+        if data_size >= self.options.target_sst_size {
+            let state_lock = self.state_lock.lock();
+            let state_read_lock = self.state.read();
+            if state_read_lock.memtable.approximate_size() >= self.options.target_sst_size {
+                drop(state_read_lock);
+                self.force_freeze_memtable(&state_lock)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let mem_table_id = self.next_sst_id();
+        let mem_table = Arc::new(MemTable::create_with_wal(
+            mem_table_id,
+            self.path_of_wal(mem_table_id),
+        )?);
+        {
+            let mut guard = self.state.write();
+            let mut snapshot = guard.as_ref().clone();
+            let old_memtable = std::mem::replace(&mut snapshot.memtable, mem_table);
+            snapshot.imm_memtables.insert(0, old_memtable);
+            *guard = Arc::new(snapshot);
+        }
+
+        Ok(())
+
+        // let state = self.state.write();
+        // state.imm_memtables.push(/* */);
+        // state.memtable = MemTable::create_with_wal(id, path)
+        // let memtable = MemTable::create(self.next_sst_id());
+        // // unimplemented!()
     }
 
     /// Force flush the earliest-created immutable memtable to disk
